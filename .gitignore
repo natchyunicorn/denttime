@@ -1,0 +1,22 @@
+# === Data — ห้าม commit เด็ดขาด (มี PII + ไฟล์ใหญ่) ===
+data/raw/
+data/output/
+data/incoming/
+data/staging/
+data/published/
+
+# === Airflow — auto-generated files ===
+airflow_home/airflow.db
+airflow_home/airflow.cfg
+airflow_home/logs/
+airflow_home/simple_auth_manager_passwords.json.generated
+airflow_home/webserver_config.py
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === OS / Editor ===
+.DS_Store
+.env
