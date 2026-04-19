@@ -70,6 +70,11 @@ def anonymize(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: h(x, prefix="A_")
     )
 
+    # ADR-001: keep rows with missing dentist license instead of dropping them.
+    # has_dentist_id = 1 when license_no exists, 0 when missing.
+    # FE team uses this flag for Two-Tier Lookup fallback strategy.
+    out["has_dentist_id"] = df["license_no"].notna().astype(int)
+
     # Clinical features (kept)
     out["treatment"] = df["treatment"]
     out["tooth_no"] = df["tooth_no"]
@@ -100,6 +105,42 @@ def anonymize(df: pd.DataFrame) -> pd.DataFrame:
     out["checked_in"] = checkin.notna().astype(int)
     out["treatment_recorded"] = tx_record.notna().astype(int)
     out["receipt_issued"] = receipt.notna().astype(int)
+
+    # ---- Appointment order features (HANDOFF spec: is_first_case) ----
+    # Rank appointments within (dentist, date) by start time.
+    # "is_first_case" = dentist's first appointment of the day.
+    # This signal is lost by the 4-hour bucket generalization above.
+    dentist_key = df["license_no"].apply(normalize_license)
+    date_key = start.dt.date
+
+    rank_df = pd.DataFrame({
+        "_dentist": dentist_key,
+        "_date": date_key,
+        "_start": start,
+        "_aid": df["appointment_id"],   # tie-breaker for same-minute slots
+    }).reset_index()
+
+    # Sort by dentist → date → start time → appointment_id (deterministic)
+    rank_df = rank_df.sort_values(["_dentist", "_date", "_start", "_aid"])
+
+    # dropna=False: keep null-license rows in their own group
+    # (without this, pandas skips null keys → length mismatch on assign)
+    rank_df["_rank"] = (
+        rank_df.groupby(["_dentist", "_date"], dropna=False).cumcount() + 1
+    )
+
+    # Restore original row order before assigning back
+    rank_df = rank_df.sort_values("index")
+
+    out["appointment_rank_in_day"] = rank_df["_rank"].values
+    out["is_first_case"] = (out["appointment_rank_in_day"] == 1).astype(int)
+
+    # Null-license handling: rank within "unknown dentist" partition has no
+    # semantic meaning (it groups ALL unknown dentists together).
+    # Overwrite with NaN/0 so the feature doesn't leak false signal.
+    null_license_mask = df["license_no"].isna().values
+    out.loc[null_license_mask, "appointment_rank_in_day"] = pd.NA
+    out.loc[null_license_mask, "is_first_case"] = 0
 
     return out
 
@@ -178,16 +219,13 @@ if __name__ == "__main__":
 
     df_out = anonymize(df_in)
 
-    # ---- Post-filter: enforce ML + privacy constraints ----
-    before = len(df_out)
+    # ---- Post-filter: enforce privacy constraints ----
+    # ADR-001: no longer drop rows with missing dentist_pseudo_id.
+    # Rows are kept with dentist_pseudo_id=NULL + has_dentist_id=0.
+    null_dentist = df_out["dentist_pseudo_id"].isna().sum()
+    print(f"\nRows with missing dentist_pseudo_id (kept): {null_dentist}")
 
-    # 1. Drop rows without dentist — DentTime needs dentist_pseudo_id as feature
-    df_out = df_out.dropna(subset=["dentist_pseudo_id"])
-    dropped_no_dentist = before - len(df_out)
-    if dropped_no_dentist > 0:
-        print(f"\nDropped {dropped_no_dentist} rows with missing dentist_pseudo_id")
-
-    # 2. Drop rows violating k-anonymity (k=5)
+    # Drop rows violating k-anonymity (k=5)
     qi = ["clinic_pseudo_id", "appt_year_month", "appt_day_of_week", "appt_hour_bucket"]
     group_sizes = df_out.groupby(qi, dropna=False).transform("size")
     before_k = len(df_out)
